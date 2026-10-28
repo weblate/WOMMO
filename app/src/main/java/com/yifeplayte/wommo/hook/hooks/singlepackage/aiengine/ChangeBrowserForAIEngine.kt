@@ -53,8 +53,12 @@ object ChangeBrowserForAIEngine : BaseHook() {
     private const val NOTIFICATION_ID = 111
     private const val TRAILING_CHARS = ".,!?;:，。！？；：、）】》〉」』]}>"
     private const val STATUS_NOT_RECOGNIZED = -103
+    private const val STATUS_RECOGNIZED = 0
+    private const val TAG_XUNLEI = 8
     private const val TAG_BROWSER = 11
+    private const val TAG_WPS = 19
     private const val PACKAGE_NAME_XIAOMI_BROWSER = "com.android.browser"
+    private const val PACKAGE_NAME_WPS = "cn.wps.moffice_eng"
     private const val BROWSER_ICON_RES = "app_icon_com_android_browser"
     private const val TARGET_PACKAGE_PREFIX = "wommo_target:"
     private val drawableImageActionGo by lazy {
@@ -354,12 +358,32 @@ object ChangeBrowserForAIEngine : BaseHook() {
 
     // The agent generation leaves the clip text type empty when nothing matched, so the legacy
     // supplement never applies; fill it in there to keep plain links reaching the browser cue.
-    private fun hookAgentClipTextCategory() {        methodGetClipTextCategory.createHook {
+    // A recognized link can still land on the Xunlei category: its rule claims every http(s) URL
+    // ending in a download extension, so a browsable .zip artifact is offered as a download. Hand
+    // that category to the browser cue, whose intent carries no package and lets Android resolve
+    // the scheme or host instead. WPS keeps its category while the host's own check passes.
+    private fun hookAgentClipTextCategory() {
+        methodGetClipTextCategory.createHook {
             after { param ->
                 val input = (param.args.getOrNull(1) as? Bundle)?.getString("in") ?: return@after
                 val result = param.result as? Bundle ?: return@after
                 val output = result.getString("target_out") ?: return@after
-                if (runCatching { JSONObject(output).optInt("status") }.getOrNull() != STATUS_NOT_RECOGNIZED) return@after
+                val outputJson = runCatching { JSONObject(output) }.getOrNull() ?: return@after
+                val status = outputJson.optInt("status")
+                if (status == STATUS_RECOGNIZED) {
+                    // A Xunlei passphrase such as 【迅雷口令#Xxxx#】 has no scheme; a browser cue for it
+                    // would carry nonsense, so leave it to the host.
+                    if (!outputJson.optString("recognitionText").hasUriScheme()) return@after
+                    val retag = when (outputJson.optInt("tag")) {
+                        TAG_XUNLEI -> TAG_BROWSER
+                        TAG_WPS -> if (isPackageInstalled(PACKAGE_NAME_WPS)) null else TAG_BROWSER
+                        else -> null
+                    } ?: return@after
+                    result.putString("target_out", JSONObject(outputJson.toString()).apply { put("tag", retag) }.toString())
+                    param.result = result
+                    return@after
+                }
+                if (status != STATUS_NOT_RECOGNIZED) return@after
                 val inputJson = runCatching { JSONObject(input) }.getOrNull() ?: return@after
                 val copyText = inputJson.optString("copyText")
                 val uri = uriRegex.find(copyText)?.value?.trimEnd { it in TRAILING_CHARS } ?: return@after
@@ -456,7 +480,18 @@ object ChangeBrowserForAIEngine : BaseHook() {
         }
     }
 
-    fun String.withHttpsIfMissing(): String = if ("://" in this) this else "https://$this"
+    // Only bare hosts need the scheme added; anything that already carries one, including the
+    // schemeless magnet:?xt=... form, must reach Android untouched.
+    private val schemeRegex = Regex("^[A-Za-z][A-Za-z0-9+.-]*:")
+
+    fun String.withHttpsIfMissing(): String = if (schemeRegex.containsMatchIn(this)) this else "https://$this"
+
+    // Uri.parse is the only reliable check here: it reports no scheme for a Xunlei passphrase and
+    // a scheme for magnet:, thunder:, ed2k:// and ftp://, which java.net.URI and URLUtil reject.
+    private fun String.hasUriScheme(): Boolean = runCatching { toUri().scheme }.getOrNull() != null
+
+    private fun isPackageInstalled(packageName: String): Boolean =
+        runCatching { EzXposed.appContext.packageManager.getPackageInfo(packageName, 0) }.isSuccess
 
     fun dp2px(context: Context, dpValue: Float): Int = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, dpValue, context.resources.displayMetrics).toInt()
 
